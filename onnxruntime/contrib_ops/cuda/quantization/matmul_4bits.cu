@@ -220,6 +220,146 @@ __device__ __forceinline__ void AccumulateEightElements4b(uint32_t values_quant,
 #endif
 }
 
+// ===== Small-M (verify-block) support =====
+// The M=1 GEMV is fast because it streams 4-bit weights and dequantizes them in
+// registers (never materializing fp16 weights). The default M>1 path instead
+// dequantizes the whole weight matrix to fp16 + cuBLAS GEMM, whose fixed cost
+// dominates for small M. To keep the M=1 weight-bandwidth profile for small M,
+// we split the fused primitive into: DequantizeEight4b (the bit-unpack + scale,
+// which is M-invariant -> done once per weight tile) and AccumulateRow (the cheap
+// per-activation-row FMA), then reuse the dequantized weights across CtaM rows.
+// Numerics are identical to AccumulateEightElements4b above (bit-exact vs the M=1
+// kernel; validated against an fp32 reference for half/bf16/float).
+template <class T>
+struct DequantizedEight;
+template <>
+struct DequantizedEight<half> {
+  half2 v[4];
+};
+template <>
+struct DequantizedEight<float> {
+  float v[8];
+};
+template <>
+struct DequantizedEight<nv_bfloat16> {
+  __nv_bfloat162 v[4];
+};
+
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 530) && !defined(__HIPCC__)
+// half fast path: dequantized weights in order [04,15,26,37] to match the
+// permuted activation layout used in AccumulateRow.
+__device__ __forceinline__ void DequantizeEight4b(uint32_t values_quant, half scale, uint8_t zp,
+                                                  DequantizedEight<half>& d) {
+  half2 scale_half2 = {scale, scale};
+  half zp_adjust = -scale * __short2half_rn(zp);
+  half2 zp_adjust2 = {zp_adjust, zp_adjust};
+  half2 elements[4];
+  Convert8xInt4To8xHalfs(values_quant, elements);
+  d.v[0] = elements[0] * scale_half2 + zp_adjust2;
+  d.v[1] = elements[1] * scale_half2 + zp_adjust2;
+  d.v[2] = elements[2] * scale_half2 + zp_adjust2;
+  d.v[3] = elements[3] * scale_half2 + zp_adjust2;
+}
+__device__ __forceinline__ void AccumulateRow(const DequantizedEight<half>& d, const half* a, half* sums) {
+  uint4 vec_a = *(reinterpret_cast<const uint4*>(a));
+  constexpr uint32_t kLowHalf2 = 0x5410;
+  constexpr uint32_t kHighHalf2 = 0x7632;
+  uint4 vp;
+  asm volatile("prmt.b32 %0, %1, %2, %3;\n" : "=r"(vp.x) : "r"(vec_a.x), "r"(vec_a.z), "r"(kLowHalf2));
+  asm volatile("prmt.b32 %0, %1, %2, %3;\n" : "=r"(vp.y) : "r"(vec_a.x), "r"(vec_a.z), "r"(kHighHalf2));
+  asm volatile("prmt.b32 %0, %1, %2, %3;\n" : "=r"(vp.z) : "r"(vec_a.y), "r"(vec_a.w), "r"(kLowHalf2));
+  asm volatile("prmt.b32 %0, %1, %2, %3;\n" : "=r"(vp.w) : "r"(vec_a.y), "r"(vec_a.w), "r"(kHighHalf2));
+  half2* s = reinterpret_cast<half2*>(sums);
+  s[0] = s[0] + d.v[0] * (*(reinterpret_cast<half2*>(&vp.x)));
+  s[1] = s[1] + d.v[1] * (*(reinterpret_cast<half2*>(&vp.y)));
+  s[2] = s[2] + d.v[2] * (*(reinterpret_cast<half2*>(&vp.z)));
+  s[3] = s[3] + d.v[3] * (*(reinterpret_cast<half2*>(&vp.w)));
+}
+#else
+// half slow path: natural order [01,23,45,67], no permute (matches the <530
+// AccumulateEightElements4b variant above).
+__device__ __forceinline__ void DequantizeEight4b(uint32_t values_quant, half scale, uint8_t zp,
+                                                  DequantizedEight<half>& d) {
+  half2 scale_half2 = {scale, scale};
+  half zp_adjust = -scale * __short2half_rn(zp);
+  half2 zp_adjust2 = {zp_adjust, zp_adjust};
+  half2 e01 = __halves2half2(__uint2half_rn(values_quant & 0xF), __uint2half_rn((values_quant >> 4) & 0xF));
+  half2 e23 = __halves2half2(__uint2half_rn((values_quant >> 8) & 0xF), __uint2half_rn((values_quant >> 12) & 0xF));
+  half2 e45 = __halves2half2(__uint2half_rn((values_quant >> 16) & 0xF), __uint2half_rn((values_quant >> 20) & 0xF));
+  half2 e67 = __halves2half2(__uint2half_rn((values_quant >> 24) & 0xF), __uint2half_rn((values_quant >> 28) & 0xF));
+  d.v[0] = e01 * scale_half2 + zp_adjust2;
+  d.v[1] = e23 * scale_half2 + zp_adjust2;
+  d.v[2] = e45 * scale_half2 + zp_adjust2;
+  d.v[3] = e67 * scale_half2 + zp_adjust2;
+}
+__device__ __forceinline__ void AccumulateRow(const DequantizedEight<half>& d, const half* a, half* sums) {
+  uint4 vec_a = *(reinterpret_cast<const uint4*>(a));
+  half2* s = reinterpret_cast<half2*>(sums);
+  s[0] = s[0] + d.v[0] * (*(reinterpret_cast<half2*>(&vec_a.x)));
+  s[1] = s[1] + d.v[1] * (*(reinterpret_cast<half2*>(&vec_a.y)));
+  s[2] = s[2] + d.v[2] * (*(reinterpret_cast<half2*>(&vec_a.z)));
+  s[3] = s[3] + d.v[3] * (*(reinterpret_cast<half2*>(&vec_a.w)));
+}
+#endif
+
+__device__ __forceinline__ void DequantizeEight4b(uint32_t values_quant, float scale, uint8_t zp,
+                                                  DequantizedEight<float>& d) {
+  float zp_adjust = -scale * zp;
+  d.v[0] = float(values_quant & 0xF) * scale + zp_adjust;
+  d.v[1] = float((values_quant >> 4) & 0xF) * scale + zp_adjust;
+  d.v[2] = float((values_quant >> 8) & 0xF) * scale + zp_adjust;
+  d.v[3] = float((values_quant >> 12) & 0xF) * scale + zp_adjust;
+  d.v[4] = float((values_quant >> 16) & 0xF) * scale + zp_adjust;
+  d.v[5] = float((values_quant >> 20) & 0xF) * scale + zp_adjust;
+  d.v[6] = float((values_quant >> 24) & 0xF) * scale + zp_adjust;
+  d.v[7] = float((values_quant >> 28) & 0xF) * scale + zp_adjust;
+}
+__device__ __forceinline__ void AccumulateRow(const DequantizedEight<float>& d, const float* a, float* sums) {
+  float4 a_vec_0 = *(reinterpret_cast<const float4*>(a));
+  float4 a_vec_1 = *(reinterpret_cast<const float4*>(a + 4));
+  sums[0] += d.v[0] * a_vec_0.x;
+  sums[1] += d.v[1] * a_vec_0.y;
+  sums[2] += d.v[2] * a_vec_0.z;
+  sums[3] += d.v[3] * a_vec_0.w;
+  sums[4] += d.v[4] * a_vec_1.x;
+  sums[5] += d.v[5] * a_vec_1.y;
+  sums[6] += d.v[6] * a_vec_1.z;
+  sums[7] += d.v[7] * a_vec_1.w;
+}
+
+__device__ __forceinline__ void DequantizeEight4b(uint32_t values_quant, nv_bfloat16 scale, uint8_t zp,
+                                                  DequantizedEight<nv_bfloat16>& d) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  __nv_bfloat162 scale_bf162 = __bfloat162bfloat162(scale);
+  nv_bfloat16 zp_adjust = -scale * __uint2bfloat16_rn(zp);
+  __nv_bfloat162 zp_adjust2 = __bfloat162bfloat162(zp_adjust);
+  __nv_bfloat162 elements[4];
+  Convert8xInt4To8xBF16s(values_quant, elements);
+  d.v[0] = __hfma2(elements[0], scale_bf162, zp_adjust2);
+  d.v[1] = __hfma2(elements[1], scale_bf162, zp_adjust2);
+  d.v[2] = __hfma2(elements[2], scale_bf162, zp_adjust2);
+  d.v[3] = __hfma2(elements[3], scale_bf162, zp_adjust2);
+#endif
+}
+__device__ __forceinline__ void AccumulateRow(const DequantizedEight<nv_bfloat16>& d, const nv_bfloat16* a,
+                                              nv_bfloat16* sums) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  const uint4 vec_a = *(reinterpret_cast<const uint4*>(a));
+  constexpr uint32_t kLowHalf2 = 0x5410;
+  constexpr uint32_t kHighHalf2 = 0x7632;
+  uint4 vp;
+  asm volatile("prmt.b32 %0, %1, %2, %3;\n" : "=r"(vp.x) : "r"(vec_a.x), "r"(vec_a.z), "r"(kLowHalf2));
+  asm volatile("prmt.b32 %0, %1, %2, %3;\n" : "=r"(vp.y) : "r"(vec_a.x), "r"(vec_a.z), "r"(kHighHalf2));
+  asm volatile("prmt.b32 %0, %1, %2, %3;\n" : "=r"(vp.z) : "r"(vec_a.y), "r"(vec_a.w), "r"(kLowHalf2));
+  asm volatile("prmt.b32 %0, %1, %2, %3;\n" : "=r"(vp.w) : "r"(vec_a.y), "r"(vec_a.w), "r"(kHighHalf2));
+  __nv_bfloat162* s = reinterpret_cast<__nv_bfloat162*>(sums);
+  s[0] = __hfma2(d.v[0], *reinterpret_cast<const __nv_bfloat162*>(&vp.x), s[0]);
+  s[1] = __hfma2(d.v[1], *reinterpret_cast<const __nv_bfloat162*>(&vp.y), s[1]);
+  s[2] = __hfma2(d.v[2], *reinterpret_cast<const __nv_bfloat162*>(&vp.z), s[2]);
+  s[3] = __hfma2(d.v[3], *reinterpret_cast<const __nv_bfloat162*>(&vp.w), s[3]);
+#endif
+}
+
 constexpr int kColsPerThreadBlock = 8;
 constexpr int kElementsPerThreadPerIteration = 8;
 constexpr int kWarpSize = GPU_WARP_SIZE;
@@ -325,6 +465,157 @@ __global__ void __launch_bounds__(kWarpSize* kColsPerThreadBlock) MatMulFloatInt
   }
 }  // namespace cuda
 
+// Maximum M handled by the fused small-M kernel; larger M falls back to the
+// dequantize + cuBLAS GEMM path (where weight reuse across many rows amortizes
+// the materialization). 8 covers the speculative-decoding verify block
+// (num_draft_tokens + 1, typically <= 8).
+constexpr int kMaxSmallM = 8;
+
+// Fused small-M kernel: like the M=1 GEMV, but each warp loads + dequantizes its
+// weight tile ONCE and reuses it across CtaM activation rows (grid.y == 1; one
+// block computes [CtaM, kColsPerThreadBlock]). Keeps the M=1 weight-bandwidth
+// profile for small M, avoiding the fp16 materialization of the GEMM fallback.
+template <class T, int block_size, bool has_zero_point, int CtaM>
+__global__ void __launch_bounds__(kWarpSize* kColsPerThreadBlock) MatMulFloatInt4KernelSmallM(
+    T* output,
+    const T* a_data,
+    const uint8_t* b_data_quant,
+    const T* scales_data,
+    const uint8_t* zero_points,
+    int n,
+    int k,
+    int blocks_per_K) {
+  const int n_block_id = blockIdx.x;
+  const int lane_id = threadIdx.x;
+  const int warp_id = WarpUniform(threadIdx.y);
+  const int n_id = n_block_id * kColsPerThreadBlock + warp_id;
+  constexpr int k_per_iter = kWarpSize * kElementsPerThreadPerIteration;
+
+  extern __shared__ char shared_buffer[];
+  T* b_scale_vec = (T*)shared_buffer;
+  int offset = n_block_id * kColsPerThreadBlock * blocks_per_K;
+  for (int i = warp_id * kWarpSize + lane_id; i < kColsPerThreadBlock * blocks_per_K; i += kColsPerThreadBlock * kWarpSize) {
+    b_scale_vec[i] = scales_data[offset + i];
+  }
+
+  uint8_t* b_zp_vec;
+  (void)b_zp_vec;
+  if constexpr (has_zero_point) {
+    b_zp_vec = reinterpret_cast<uint8_t*>(b_scale_vec + kColsPerThreadBlock * blocks_per_K);
+    const int b_zp_k = (blocks_per_K + 1) / 2;
+    int zp_offset = n_block_id * kColsPerThreadBlock * b_zp_k;
+    for (int i = warp_id * kWarpSize + lane_id; i < kColsPerThreadBlock * b_zp_k; i += kColsPerThreadBlock * kWarpSize) {
+      b_zp_vec[2 * i] = (zero_points[zp_offset + i] & 0x0f);
+      b_zp_vec[2 * i + 1] = (zero_points[zp_offset + i] >> 4);
+    }
+    b_zp_vec += warp_id * b_zp_k * 2;
+  }
+  __syncthreads();
+
+  const T* a_base = a_data + (lane_id << 3);  // row r adds r * k
+  b_scale_vec += warp_id * blocks_per_K;
+
+  T sums[CtaM][8];
+#pragma unroll
+  for (int r = 0; r < CtaM; r++) {
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      sums[r][j] = static_cast<T>(0.f);
+    }
+  }
+  int k_id = 0;
+  int t_meta_k = lane_id * 8 / block_size;
+  b_data_quant += n_id * blocks_per_K * (block_size / 2) + lane_id * 4;
+
+#define UnRollReduction(unroll_size)                                                              \
+  do {                                                                                            \
+    constexpr int kUnroll = unroll_size;                                                          \
+    constexpr int kUnrollStep = kUnroll * k_per_iter;                                             \
+    const int k_unroll_bound = k - k % kUnrollStep;                                               \
+    for (; k_id < k_unroll_bound; k_id += kUnrollStep) {                                          \
+      _Pragma("unroll") for (int i = 0; i < kUnroll; i++) {                                       \
+        uint32_t value = *(reinterpret_cast<const uint32_t*>(b_data_quant + k_per_iter / 2 * i)); \
+        T scale = b_scale_vec[t_meta_k + k_per_iter / block_size * i];                            \
+        uint8_t zp = 8;                                                                           \
+        if constexpr (has_zero_point) {                                                           \
+          zp = b_zp_vec[t_meta_k + k_per_iter / block_size * i];                                  \
+        }                                                                                         \
+        DequantizedEight<T> dq;                                                                   \
+        DequantizeEight4b(value, scale, zp, dq);                                                  \
+        _Pragma("unroll") for (int r = 0; r < CtaM; r++) {                                        \
+          AccumulateRow(dq, a_base + r * k + k_id + i * k_per_iter, sums[r]);                     \
+        }                                                                                         \
+      }                                                                                           \
+      b_data_quant += k_per_iter / 2 * kUnroll;                                                   \
+      t_meta_k += k_per_iter / block_size * kUnroll;                                              \
+    }                                                                                             \
+  } while (false)
+
+  UnRollReduction(16);
+  UnRollReduction(4);
+  UnRollReduction(1);
+#undef UnRollReduction
+
+  // handle reminder
+  if (k_id + lane_id * 8 < k) {
+    uint32_t value = *(reinterpret_cast<const uint32_t*>(b_data_quant));
+    T scale = b_scale_vec[t_meta_k];
+    uint8_t zp = 8;
+    if constexpr (has_zero_point) {
+      zp = b_zp_vec[t_meta_k];
+    }
+    DequantizedEight<T> dq;
+    DequantizeEight4b(value, scale, zp, dq);
+#pragma unroll
+    for (int r = 0; r < CtaM; r++) {
+      AccumulateRow(dq, a_base + r * k + k_id, sums[r]);
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < CtaM; r++) {
+    float sum = (float)(sums[r][0] + sums[r][1] + sums[r][2] + sums[r][3] +
+                        sums[r][4] + sums[r][5] + sums[r][6] + sums[r][7]);
+    for (int i = kWarpSize / 2; i > 0; i = i / 2) {
+      sum += WARP_SHFL_DOWN(sum, i);
+    }
+    if (lane_id == 0) {
+      output[r * n + n_id] = sum;
+    }
+  }
+}
+
+// Dispatch the small-M kernel for a compile-time block_size, switching on the
+// runtime m to pick CtaM == m (one m-tile, grid.y == 1).
+template <class T, int block_size>
+void LaunchSmallMKernel(int m, dim3 blocks, dim3 threads, size_t shared_mem_size, cudaStream_t stream,
+                        T* output, const T* a_data, const uint8_t* b_data_quant, const T* scales_data,
+                        const uint8_t* zero_points, int n, int k, int blocks_per_K) {
+#define MatMulSmallMDispatch(CtaM)                                                                          \
+  case CtaM:                                                                                                \
+    if (nullptr != zero_points) {                                                                           \
+      MatMulFloatInt4KernelSmallM<T, block_size, true, CtaM><<<blocks, threads, shared_mem_size, stream>>>( \
+          output, a_data, b_data_quant, scales_data, zero_points, n, k, blocks_per_K);                      \
+    } else {                                                                                                \
+      MatMulFloatInt4KernelSmallM<T, block_size, false, CtaM><<<blocks, threads, shared_mem_size, stream>>>(\
+          output, a_data, b_data_quant, scales_data, zero_points, n, k, blocks_per_K);                      \
+    }                                                                                                       \
+    break;
+  switch (m) {
+    MatMulSmallMDispatch(2);
+    MatMulSmallMDispatch(3);
+    MatMulSmallMDispatch(4);
+    MatMulSmallMDispatch(5);
+    MatMulSmallMDispatch(6);
+    MatMulSmallMDispatch(7);
+    MatMulSmallMDispatch(8);
+    default:
+      ORT_THROW("small-M kernel does not support m=", m);
+  }
+#undef MatMulSmallMDispatch
+}
+
+
 template <class T>
 bool TryMatMul4Bits(
     T* output,
@@ -338,7 +629,7 @@ bool TryMatMul4Bits(
     int block_size,
     size_t shared_mem_per_block,
     cudaStream_t stream) {
-  if (n % kColsPerThreadBlock != 0 || k % 8 != 0 || m > 1) {
+  if (n % kColsPerThreadBlock != 0 || k % 8 != 0 || m < 1 || m > kMaxSmallM) {
     return false;
   }
   dim3 blocks((n + kColsPerThreadBlock - 1) / kColsPerThreadBlock, m);
@@ -348,6 +639,28 @@ bool TryMatMul4Bits(
                            static_cast<size_t>(zero_points != nullptr ? (blocks_per_K + 1) / 2 * kColsPerThreadBlock * 2 : 0);
   if (shared_mem_size > shared_mem_per_block) {
     return false;
+  }
+
+  // Small-M (2..kMaxSmallM): one block computes CtaM=m rows, grid.y == 1.
+  if (m > 1) {
+    dim3 sm_blocks((n + kColsPerThreadBlock - 1) / kColsPerThreadBlock, 1);
+    if (16 == block_size) {
+      LaunchSmallMKernel<T, 16>(m, sm_blocks, threads, shared_mem_size, stream,
+                                output, a_data, b_data_quant, scales_data, zero_points, n, k, blocks_per_K);
+    } else if (32 == block_size) {
+      LaunchSmallMKernel<T, 32>(m, sm_blocks, threads, shared_mem_size, stream,
+                                output, a_data, b_data_quant, scales_data, zero_points, n, k, blocks_per_K);
+    } else if (64 == block_size) {
+      LaunchSmallMKernel<T, 64>(m, sm_blocks, threads, shared_mem_size, stream,
+                                output, a_data, b_data_quant, scales_data, zero_points, n, k, blocks_per_K);
+    } else if (128 == block_size) {
+      LaunchSmallMKernel<T, 128>(m, sm_blocks, threads, shared_mem_size, stream,
+                                 output, a_data, b_data_quant, scales_data, zero_points, n, k, blocks_per_K);
+    } else {
+      // Unusual block size: fall back to the dequantize + cuBLAS GEMM path.
+      return false;
+    }
+    return true;
   }
 
 #define MatMulFloatInt4KernelDispatch(block_size)                                              \
